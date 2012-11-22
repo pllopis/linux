@@ -74,6 +74,30 @@ struct ioctl_gntalloc_unmap_notify {
 	uint32_t event_channel_port;
 };
 
+#define MAX_GNTALLOC_DOMID_COUNT    64
+/*
+ * Allocates a new page and creates a new grant reference for various domains.
+ */
+#define IOCTL_GNTALLOC_ALLOC_GREF_MULTI \
+_IOC(_IOC_NONE, 'G', 8, sizeof(struct ioctl_gntalloc_alloc_gref_multi))
+struct ioctl_gntalloc_alloc_gref_multi {
+    /* IN parameters */
+    /* The number of domains to be given access */
+    uint16_t domid_count;
+    /* The IDs of the domains to be given access to the grants. */
+    uint16_t domids[MAX_GNTALLOC_DOMID_COUNT];
+    /* Flags for this mapping */
+    uint16_t flags;
+    /* Number of pages to map */
+    uint32_t count;
+    /* OUT parameters */
+    /* The offset to be used on a subsequent call to mmap(). */
+    uint64_t index;
+    /* The grant references of the newly created grant, one per page */
+    /* Variable size, size will be count * domid_count. */
+    uint32_t gref_ids[1];
+};
+
 /* Clear (set to zero) the byte specified by index */
 #define UNMAP_NOTIFY_CLEAR_BYTE 0x1
 /* Send an interrupt on the indicated event channel */

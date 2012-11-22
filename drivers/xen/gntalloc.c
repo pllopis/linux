@@ -177,6 +177,76 @@ undo:
 	return rc;
 }
 
+static int add_grefs_multi(struct ioctl_gntalloc_alloc_gref_multi *op,
+    uint32_t *gref_ids, struct gntalloc_file_private_data *priv)
+{
+    int i, j, rc, readonly;
+    LIST_HEAD(queue_gref);
+    LIST_HEAD(queue_file);
+    struct gntalloc_gref *gref;
+    struct page *shared_page = NULL;
+    int k = 0;
+
+    readonly = !(op->flags & GNTALLOC_FLAG_WRITABLE);
+    rc = -ENOMEM;
+    for (i = 0; i < op->count; i++) {
+        shared_page = alloc_page(GFP_KERNEL|__GFP_ZERO);
+        gref = kzalloc(sizeof(*gref), GFP_KERNEL);
+        if (!gref) {
+            if (shared_page)
+                __free_page(shared_page);
+            goto undo2;
+        }
+        list_add_tail(&gref->next_gref, &queue_gref);
+        list_add_tail(&gref->next_file, &queue_file);
+        k++;
+        gref->users = 1;
+        gref->file_index = op->index + i * PAGE_SIZE;
+        gref->page = shared_page;
+        if (!gref->page)
+            goto undo2;
+
+        /* Grant foreign access to the page to each domid. */
+        for (j = 0; j < op->domid_count; j++) {
+            gref->gref_id = gnttab_grant_foreign_access(op->domid,
+                pfn_to_mfn(page_to_pfn(gref->page)), readonly);
+            if ((int)gref->gref_id < 0) {
+                rc = gref->gref_id;
+                goto undo2;
+            }
+            gref_ids[i] = gref->gref_id;
+        }
+    }
+
+    /* Add to gref lists. */
+    mutex_lock(&gref_mutex);
+    list_splice_tail(&queue_gref, &gref_list);
+    list_splice_tail(&queue_file, &priv->list);
+    mutex_unlock(&gref_mutex);
+
+    return 0;
+
+undo2:
+    mutex_lock(&gref_mutex);
+    gref_size -= (op->count - k);
+
+    list_for_each_entry(gref, &queue_file, next_file) {
+        /* __del_gref does not remove from queue_file */
+        __del_gref(gref);
+    }
+
+    /* It's possible for the target domain to map the just-allocated grant
+     * references by blindly guessing their IDs; if this is done, then
+     * __del_gref will leave them in the queue_gref list. They need to be
+     * added to the global list so that we can free them when they are no
+     * longer referenced.
+     */
+    if (unlikely(!list_empty(&queue_gref)))
+        list_splice_tail(&queue_gref, &gref_list);
+    mutex_unlock(&gref_mutex);
+    return rc;
+}
+
 static void __del_gref(struct gntalloc_gref *gref)
 {
 	if (gref->notify.flags & UNMAP_NOTIFY_CLEAR_BYTE) {
@@ -339,6 +409,72 @@ out:
 	return rc;
 }
 
+static long gntalloc_ioctl_alloc_multi(struct gntalloc_file_private_data *priv,
+        struct ioctl_gntalloc_alloc_gref_multi __user *arg)
+{
+    int rc = 0;
+    struct ioctl_gntalloc_alloc_gref_multi op;
+    uint32_t *gref_ids;
+    int count;
+
+    pr_debug("%s: priv %p\n", __func__, priv);
+
+    if (copy_from_user(&op, arg, sizeof(op))) {
+        rc = -EFAULT;
+        goto out;
+    }
+
+    count = op.count * op.domid_count;
+
+    gref_ids = kcalloc(count, sizeof(gref_ids[0]), GFP_TEMPORARY);
+    if (!gref_ids) {
+        rc = -ENOMEM;
+        goto out;
+    }
+
+    mutex_lock(&gref_mutex);
+    /* Clean up pages that were at zero (local) users but were still mapped
+     * by remote domains. Since those pages count towards the limit that we
+     * are about to enforce, removing them here is a good idea.
+     */
+    do_cleanup();
+    if (gref_size + count > limit) {
+        mutex_unlock(&gref_mutex);
+        rc = -ENOSPC;
+        goto out_free;
+    }
+    gref_size += count;
+    op.index = priv->index;
+    priv->index += op.count * PAGE_SIZE;
+    mutex_unlock(&gref_mutex);
+
+    rc = add_grefs_multi(&op, gref_ids, priv);
+    if (rc < 0)
+        goto out_free;
+
+    /* Once we finish add_grefs, it is unsafe to touch the new reference,
+     * since it is possible for a concurrent ioctl to remove it (by guessing
+     * its index). If the userspace application doesn't provide valid memory
+     * to write the IDs to, then it will need to close the file in order to
+     * release - which it will do by segfaulting when it tries to access the
+     * IDs to close them.
+     */
+    if (copy_to_user(arg, &op, sizeof(op))) {
+        rc = -EFAULT;
+        goto out_free;
+    }
+    if (copy_to_user(arg->gref_ids, gref_ids,
+            sizeof(gref_ids[0]) * count)) {
+        rc = -EFAULT;
+        goto out_free;
+    }
+
+out_free:
+    kfree(gref_ids);
+out:
+    return rc;
+}
+
 static long gntalloc_ioctl_dealloc(struct gntalloc_file_private_data *priv,
 		void __user *arg)
 {
@@ -447,6 +583,9 @@ static long gntalloc_ioctl(struct file *filp, unsigned int cmd,
 
 	case IOCTL_GNTALLOC_SET_UNMAP_NOTIFY:
 		return gntalloc_ioctl_unmap_notify(priv, (void __user *)arg);
+
+    case IOCTL_GNTALLOC_ALLOC_GREF_MULTI:
+            return gntalloc_ioctl_alloc_multi(priv, (void __user *)arg);
 
 	default:
 		return -ENOIOCTLCMD;
